@@ -1,0 +1,6 @@
+{
+  "name": "Recorte Studio",
+  "description": "Estudio web para eliminar el fondo de imágenes con previsualización en tiempo real, procesamiento por lotes y exportación en PNG transparente, JPG y WebP mediante Sharp y Jimp.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
