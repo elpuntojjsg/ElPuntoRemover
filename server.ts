@@ -1,12 +1,11 @@
 import 'dotenv/config';
 import express from 'express';
-import type { Request, Response } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import sharp from 'sharp';
 import { Jimp, JimpMime } from 'jimp';
-import { createServer as createViteServer } from 'vite';
 import {
   applyPostMaskRefinement,
   DEFAULT_REMOVAL_OPTIONS,
@@ -22,14 +21,25 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
 
+interface CropRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 interface ProcessSettings {
   engine: ProcessingEngine;
   format: ExportFormat;
   quality: number;
+  scalePercent: number;
   maxWidth: number;
+  pngOptimize: boolean;
+  pngColors: number;
   backgroundColor: string;
   useSolidBackground: boolean;
   preSegmented?: boolean;
+  cropRect?: CropRect;
   removal: RemovalOptions;
 }
 
@@ -81,6 +91,43 @@ function parseBrushMask(rawMask: unknown): BrushMaskLayer | undefined {
   return undefined;
 }
 
+function sanitizeCropRect(raw: unknown): CropRect | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Partial<CropRect>;
+  if (
+    typeof r.x !== 'number' ||
+    typeof r.y !== 'number' ||
+    typeof r.w !== 'number' ||
+    typeof r.h !== 'number'
+  ) {
+    return undefined;
+  }
+  const x = Math.max(0, Math.min(0.95, r.x));
+  const y = Math.max(0, Math.min(0.95, r.y));
+  const w = Math.max(0.05, Math.min(1 - x, r.w));
+  const h = Math.max(0.05, Math.min(1 - y, r.h));
+  if (x <= 0.002 && y <= 0.002 && w >= 0.996 && h >= 0.996) {
+    return undefined;
+  }
+  return { x, y, w, h };
+}
+
+function computePixelCrop(
+  imgWidth: number,
+  imgHeight: number,
+  cropRect?: CropRect,
+): { left: number; top: number; width: number; height: number } | null {
+  if (!cropRect) return null;
+  const left = Math.max(0, Math.min(imgWidth - 2, Math.round(cropRect.x * imgWidth)));
+  const top = Math.max(0, Math.min(imgHeight - 2, Math.round(cropRect.y * imgHeight)));
+  const width = Math.max(2, Math.min(imgWidth - left, Math.round(cropRect.w * imgWidth)));
+  const height = Math.max(2, Math.min(imgHeight - top, Math.round(cropRect.h * imgHeight)));
+  if (left === 0 && top === 0 && width === imgWidth && height === imgHeight) {
+    return null;
+  }
+  return { left, top, width, height };
+}
+
 function parseSettings(rawJson: string | undefined): ProcessSettings {
   let parsed: Partial<ProcessSettings> = {};
   if (rawJson) {
@@ -99,10 +146,14 @@ function parseSettings(rawJson: string | undefined): ProcessSettings {
         ? parsed.format
         : 'png',
     quality: Math.max(10, Math.min(100, Number(parsed.quality) || 90)),
+    scalePercent: Math.max(20, Math.min(100, Number(parsed.scalePercent) || 100)),
     maxWidth: Math.max(0, Number(parsed.maxWidth) || 0),
+    pngOptimize: Boolean(parsed.pngOptimize),
+    pngColors: Math.max(16, Math.min(256, Math.round(Number(parsed.pngColors) || 256))),
     backgroundColor: typeof parsed.backgroundColor === 'string' ? parsed.backgroundColor : '#ffffff',
     useSolidBackground: Boolean(parsed.useSolidBackground),
     preSegmented: Boolean(parsed.preSegmented),
+    cropRect: sanitizeCropRect(parsed.cropRect),
     removal: {
       mode:
         removalRaw.mode === 'chroma' || removalRaw.mode === 'silhouette' ? removalRaw.mode : 'auto',
@@ -144,14 +195,11 @@ async function processWithSharp(
   settings: ProcessSettings,
   brushMask?: BrushMaskLayer,
 ): Promise<{ outputBuffer: Buffer; width: number; height: number; engineLabel: string }> {
-  let pipeline = sharp(inputBuffer).rotate();
-  const meta = await pipeline.metadata();
-
-  if (settings.maxWidth > 0 && meta.width && meta.width > settings.maxWidth) {
-    pipeline = pipeline.resize({ width: settings.maxWidth, withoutEnlargement: true });
-  }
-
-  const { data, info } = await pipeline.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const { data, info } = await sharp(inputBuffer)
+    .rotate()
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
 
   const processed = settings.preSegmented
     ? applyPostMaskRefinement(data, info.width, info.height, brushMask)
@@ -169,6 +217,31 @@ async function processWithSharp(
     raw: { width: info.width, height: info.height, channels: 4 },
   });
 
+  let outWidth = info.width;
+  let outHeight = info.height;
+
+  // Apply interactive crop box (jaladores de recorte)
+  const cropPx = computePixelCrop(info.width, info.height, settings.cropRect);
+  if (cropPx) {
+    outSharp = outSharp.extract(cropPx);
+    outWidth = cropPx.width;
+    outHeight = cropPx.height;
+  }
+
+  // Apply scalePercent and/or maxWidth optimization
+  let targetWidth = outWidth;
+  if (settings.scalePercent < 100) {
+    targetWidth = Math.max(16, Math.round((outWidth * settings.scalePercent) / 100));
+  }
+  if (settings.maxWidth > 0 && targetWidth > settings.maxWidth) {
+    targetWidth = settings.maxWidth;
+  }
+  if (targetWidth < outWidth) {
+    outHeight = Math.max(1, Math.round((outHeight * targetWidth) / outWidth));
+    outWidth = targetWidth;
+    outSharp = outSharp.resize({ width: targetWidth, withoutEnlargement: true });
+  }
+
   if (settings.format === 'jpg') {
     outSharp = outSharp.flatten({ background: parseHexColor(settings.backgroundColor) }).jpeg({
       quality: settings.quality,
@@ -177,21 +250,31 @@ async function processWithSharp(
   } else if (settings.format === 'webp') {
     outSharp = outSharp.webp({
       quality: settings.quality,
-      alphaQuality: 100,
+      alphaQuality: Math.max(60, settings.quality),
       effort: 4,
     });
   } else {
-    outSharp = outSharp.png({
-      compressionLevel: Math.max(1, Math.min(9, Math.round((100 - settings.quality) / 10) + 4)),
-      adaptiveFiltering: true,
-    });
+    outSharp = outSharp.png(
+      settings.pngOptimize
+        ? {
+            palette: true,
+            colours: settings.pngColors,
+            quality: settings.quality,
+            compressionLevel: 9,
+            effort: 7,
+          }
+        : {
+            compressionLevel: Math.max(1, Math.min(9, Math.round((100 - settings.quality) / 10) + 4)),
+            adaptiveFiltering: true,
+          },
+    );
   }
 
   const outputBuffer = await outSharp.toBuffer();
   return {
     outputBuffer,
-    width: info.width,
-    height: info.height,
+    width: outWidth,
+    height: outHeight,
     engineLabel: 'Sharp (libvips)',
   };
 }
@@ -202,7 +285,6 @@ async function processWithJimp(
   brushMask?: BrushMaskLayer,
 ): Promise<{ outputBuffer: Buffer; width: number; height: number; engineLabel: string }> {
   let readableBuffer = inputBuffer;
-  // Jimp natively decodes PNG, JPEG, BMP, TIFF, GIF; normalize WebP/AVIF via Sharp if supplied
   const detectedMeta = await sharp(inputBuffer).metadata();
   const jimpNativeFormats = new Set(['png', 'jpeg', 'bmp', 'tiff', 'gif']);
   if (
@@ -214,10 +296,6 @@ async function processWithJimp(
   }
 
   const image = await Jimp.read(readableBuffer);
-  if (settings.maxWidth > 0 && image.width > settings.maxWidth) {
-    image.resize({ w: settings.maxWidth });
-  }
-
   const width = image.width;
   const height = image.height;
   const rawBytes = new Uint8ClampedArray(
@@ -238,31 +316,57 @@ async function processWithJimp(
     ? compositeOnSolidRgb(processed, parseHexColor(settings.backgroundColor))
     : processed;
 
-  // Write processed pixels back into Jimp bitmap
   image.bitmap.data.set(finalRgba);
 
+  // Apply interactive crop box (jaladores de recorte)
+  const cropPx = computePixelCrop(width, height, settings.cropRect);
+  if (cropPx) {
+    image.crop({ x: cropPx.left, y: cropPx.top, w: cropPx.width, h: cropPx.height });
+  }
+
+  // Apply scalePercent and/or maxWidth optimization
+  let targetWidth = image.width;
+  if (settings.scalePercent < 100) {
+    targetWidth = Math.max(16, Math.round((image.width * settings.scalePercent) / 100));
+  }
+  if (settings.maxWidth > 0 && targetWidth > settings.maxWidth) {
+    targetWidth = settings.maxWidth;
+  }
+  if (targetWidth < image.width) {
+    image.resize({ w: targetWidth });
+  }
+
+  const outWidth = image.width;
+  const outHeight = image.height;
   let outputBuffer: Buffer;
   let engineLabel = 'Jimp (JS puro)';
 
   if (settings.format === 'jpg') {
     outputBuffer = await image.getBuffer(JimpMime.jpeg, { quality: settings.quality });
   } else if (settings.format === 'webp') {
-    // Jimp does not ship a native WebP encoder; bridge its processed bitmap via Sharp WebP encoder
+    const croppedBytes = new Uint8ClampedArray(
+      image.bitmap.data.buffer,
+      image.bitmap.data.byteOffset,
+      image.bitmap.data.byteLength,
+    );
     outputBuffer = await sharp(
-      Buffer.from(finalRgba.buffer, finalRgba.byteOffset, finalRgba.byteLength),
-      { raw: { width, height, channels: 4 } },
+      Buffer.from(croppedBytes.buffer, croppedBytes.byteOffset, croppedBytes.byteLength),
+      { raw: { width: outWidth, height: outHeight, channels: 4 } },
     )
-      .webp({ quality: settings.quality, alphaQuality: 100 })
+      .webp({ quality: settings.quality, alphaQuality: Math.max(60, settings.quality) })
       .toBuffer();
     engineLabel = 'Jimp + WebP';
   } else {
+    if (settings.pngOptimize) {
+      image.quantize({ colors: settings.pngColors, colorDistanceFormula: 'pngquant' });
+    }
     outputBuffer = await image.getBuffer(JimpMime.png);
   }
 
   return {
     outputBuffer,
-    width,
-    height,
+    width: outWidth,
+    height: outHeight,
     engineLabel,
   };
 }
@@ -303,8 +407,9 @@ async function startServer() {
   const upload = multer({
     storage: multer.memoryStorage(),
     limits: {
-      fileSize: 25 * 1024 * 1024,
+      fileSize: 30 * 1024 * 1024,
       files: 30,
+      fieldSize: 10 * 1024 * 1024,
     },
   });
 
@@ -326,7 +431,9 @@ async function startServer() {
         return;
       }
 
-      const settings = parseSettings(typeof req.body?.settings === 'string' ? req.body.settings : undefined);
+      const settings = parseSettings(
+        typeof req.body?.settings === 'string' ? req.body.settings : undefined,
+      );
       if (req.body?.preSegmented === 'true' || req.body?.preSegmented === true) {
         settings.preSegmented = true;
       }
@@ -396,6 +503,7 @@ async function startServer() {
             ? {
                 ...globalSettings,
                 ...override.settings,
+                cropRect: sanitizeCropRect(override.settings.cropRect) ?? globalSettings.cropRect,
                 preSegmented: Boolean(override.settings.preSegmented ?? globalSettings.preSegmented),
                 removal: {
                   ...globalSettings.removal,
@@ -437,7 +545,33 @@ async function startServer() {
     }
   });
 
+  // Ensure unknown /api/* routes return JSON instead of HTML SPA fallback
+  app.use('/api/*', (_req: Request, res: Response) => {
+    res.status(404).json({ error: 'Endpoint de API no encontrado.' });
+  });
+
+  // Always return JSON for Multer / Express errors on /api/*
+  app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+    if (!req.path.startsWith('/api/')) {
+      next(err);
+      return;
+    }
+    if (err instanceof multer.MulterError) {
+      const msg =
+        err.code === 'LIMIT_FILE_SIZE'
+          ? 'Uno de los archivos supera el límite de 30 MB.'
+          : err.code === 'LIMIT_FILE_COUNT'
+            ? 'Se superó el máximo de 30 archivos por solicitud.'
+            : `Error al recibir archivo: ${err.message}`;
+      res.status(400).json({ error: msg });
+      return;
+    }
+    const message = err instanceof Error ? err.message : 'Error interno del servidor.';
+    res.status(500).json({ error: message });
+  });
+
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

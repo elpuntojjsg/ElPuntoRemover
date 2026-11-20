@@ -1,7 +1,13 @@
 import React, { useState } from 'react';
 import { Gauge, Play } from 'lucide-react';
 import type { BatchItem, ProcessedOutput } from '../types/studio';
-import { formatBytes, uint8ToBase64 } from '../utils/previewProcessor';
+import { runImglySegmentation } from '../utils/imglyProcessor';
+import {
+  compactUploadBlobIfNeeded,
+  formatBytes,
+  safeFetchJson,
+  uint8ToBase64,
+} from '../utils/previewProcessor';
 
 interface EngineComparisonViewProps {
   activeItem: BatchItem | null;
@@ -29,7 +35,6 @@ export const EngineComparisonView: React.FC<EngineComparisonViewProps> = ({ acti
       let preSegmented = false;
 
       if (activeItem.settings.pipelineMode === 'photo') {
-        const { runImglySegmentation } = await import('../utils/imglyProcessor');
         const segmented = await runImglySegmentation(
           activeItem.id,
           activeItem.file,
@@ -39,6 +44,7 @@ export const EngineComparisonView: React.FC<EngineComparisonViewProps> = ({ acti
         preSegmented = true;
       }
 
+      uploadBlob = await compactUploadBlobIfNeeded(uploadBlob);
       fd.append('image', uploadBlob, activeItem.name);
       fd.append(
         'settings',
@@ -61,12 +67,7 @@ export const EngineComparisonView: React.FC<EngineComparisonViewProps> = ({ acti
         );
       }
 
-      const res = await fetch('/api/process', { method: 'POST', body: fd });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data?.error || `Error en motor ${engine}`);
-      }
-      return data as ProcessedOutput;
+      return safeFetchJson<ProcessedOutput>('/api/process', { method: 'POST', body: fd });
     };
 
     try {

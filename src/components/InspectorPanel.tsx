@@ -9,9 +9,17 @@ import {
   type RemovalMode,
 } from '../shared/bgRemoval';
 import type { EngineSettings, ExportFormat, ProcessingEngine } from '../types/studio';
+import {
+  computeEffectiveDimensions,
+  estimateOutputBytes,
+  formatBytes,
+} from '../utils/previewProcessor';
 
 interface InspectorPanelProps {
   settings: EngineSettings;
+  naturalWidth: number;
+  naturalHeight: number;
+  originalBytes: number;
   batchCount: number;
   isProcessingCurrent: boolean;
   isProcessingBatch: boolean;
@@ -23,6 +31,9 @@ interface InspectorPanelProps {
 
 export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   settings,
+  naturalWidth,
+  naturalHeight,
+  originalBytes,
   batchCount,
   isProcessingCurrent,
   isProcessingBatch,
@@ -78,9 +89,16 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   const targetColors = settings.removal.targetColors || [];
   const showBgColorPicker = settings.format === 'jpg' || settings.useSolidBackground;
 
+  const outDims = computeEffectiveDimensions(naturalWidth, naturalHeight, settings);
+  const estBytes = estimateOutputBytes(outDims.width, outDims.height, settings);
+  const estSavingsPct =
+    originalBytes > 0 && estBytes > 0
+      ? Math.round(((originalBytes - estBytes) / originalBytes) * 100)
+      : null;
+
   return (
     <aside className="flex flex-col rounded-xl border border-neutral-200 bg-white divide-y divide-neutral-200">
-      {/* 1. Interruptor Principal de Modo: Fotografía/Cabello vs Ilustración/Degradado */}
+      {/* 1. Interruptor Principal de Modo */}
       <div className="p-5">
         <div className="flex items-center justify-between gap-2">
           <h2 className="font-display text-sm font-semibold text-neutral-900">
@@ -153,7 +171,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
               </button>
             </div>
             <p className="text-xs text-neutral-500 leading-relaxed">
-              Segmentación neuronal para retratos, cabello, pelaje y fotografías complejas. Usa los pinceles de Borrar o Restaurar en el visor para retoques puntuales.
+              Segmentación neuronal para retratos, cabello y escenas complejas. Usa el visor para encuadrar o retocar con pinceles.
             </p>
           </div>
         ) : (
@@ -219,7 +237,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
         )}
       </div>
 
-      {/* 2. Ajustes finos en tiempo real (Modo Ilustración / Degradado) */}
+      {/* 2. Jaladores de recorte en tiempo real (Modo Ilustración / Degradado) */}
       {settings.pipelineMode === 'illustration' && (
         <div className="p-5 space-y-4">
           <div className="flex items-center justify-between gap-2">
@@ -392,13 +410,13 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
         </div>
       )}
 
-      {/* 3. Motor de Exportación (Sharp vs Jimp) & Formato */}
+      {/* 3. Optimización con jaladores (Escala, Calidad, Paleta PNG) y Formato */}
       <div className="p-5 space-y-4">
         <div className="flex items-center justify-between gap-2">
           <h2 className="font-display text-sm font-semibold text-neutral-900">
-            Motor y formato de salida
+            Optimización y salida
           </h2>
-          <span className="text-xs text-neutral-500">Servidor</span>
+          <span className="text-xs text-neutral-500">Sharp / Jimp</span>
         </div>
 
         <div className="grid grid-cols-2 gap-1 rounded-lg bg-neutral-100 p-1">
@@ -449,10 +467,34 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
           ))}
         </div>
 
+        {/* Jalador de Escala (%) */}
+        <div>
+          <div className="flex items-center justify-between text-xs mb-1.5">
+            <label htmlFor="slider-scale" className="font-medium text-neutral-700">
+              Escala de resolución
+            </label>
+            <span className="font-mono tabular-nums text-neutral-900 font-medium">
+              {settings.scalePercent}%
+              {outDims.width > 0 ? ` (${outDims.width}×${outDims.height})` : ''}
+            </span>
+          </div>
+          <input
+            id="slider-scale"
+            type="range"
+            min={25}
+            max={100}
+            step={5}
+            value={settings.scalePercent}
+            onChange={(e) => onChange({ ...settings, scalePercent: Number(e.target.value) })}
+            className="w-full accent-blue-600 cursor-pointer"
+          />
+        </div>
+
+        {/* Jalador de Calidad / Compresión */}
         <div>
           <div className="flex items-center justify-between text-xs mb-1.5">
             <label htmlFor="slider-quality" className="font-medium text-neutral-700">
-              {settings.format === 'png' ? 'Optimización PNG' : 'Calidad de compresión'}
+              {settings.format === 'png' ? 'Compresión PNG' : 'Calidad de compresión'}
             </label>
             <span className="font-mono tabular-nums text-neutral-900 font-medium">
               {settings.quality}%
@@ -461,7 +503,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
           <input
             id="slider-quality"
             type="range"
-            min={20}
+            min={15}
             max={100}
             step={5}
             value={settings.quality}
@@ -470,9 +512,52 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
           />
         </div>
 
+        {/* Optimización PNG por Paleta */}
+        {settings.format === 'png' && (
+          <div className="space-y-2.5 pt-0.5">
+            <label className="flex items-center justify-between gap-3 cursor-pointer">
+              <span className="text-xs font-medium text-neutral-700">
+                Optimizar peso PNG (Paleta 8-bit)
+              </span>
+              <input
+                type="checkbox"
+                checked={settings.pngOptimize}
+                onChange={(e) =>
+                  onChange({ ...settings, pngOptimize: e.target.checked })
+                }
+                className="h-4 w-4 rounded border-neutral-300 accent-blue-600 cursor-pointer"
+              />
+            </label>
+
+            {settings.pngOptimize && (
+              <div>
+                <div className="flex items-center justify-between text-xs mb-1.5">
+                  <label htmlFor="slider-pngcolors" className="font-medium text-neutral-700">
+                    Colores máximos de paleta
+                  </label>
+                  <span className="font-mono tabular-nums text-neutral-900 font-medium">
+                    {settings.pngColors} colores
+                  </span>
+                </div>
+                <input
+                  id="slider-pngcolors"
+                  type="range"
+                  min={32}
+                  max={256}
+                  step={16}
+                  value={settings.pngColors}
+                  onChange={(e) => onChange({ ...settings, pngColors: Number(e.target.value) })}
+                  className="w-full accent-blue-600 cursor-pointer"
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Ancho máximo límite */}
         <div className="flex items-center justify-between gap-3">
           <label htmlFor="select-maxwidth" className="text-xs font-medium text-neutral-700">
-            Ancho máximo
+            Tope ancho máximo
           </label>
           <select
             id="select-maxwidth"
@@ -480,13 +565,14 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
             onChange={(e) => onChange({ ...settings, maxWidth: Number(e.target.value) })}
             className="h-9 rounded-lg border border-neutral-300 bg-white px-3 text-xs font-medium text-neutral-800 cursor-pointer"
           >
-            <option value={0}>Original (1:1)</option>
+            <option value={0}>Sin tope</option>
             <option value={2048}>2048 px</option>
             <option value={1200}>1200 px</option>
             <option value={800}>800 px</option>
           </select>
         </div>
 
+        {/* Solid Background Option */}
         {settings.format !== 'jpg' && (
           <label className="flex items-center justify-between gap-3 cursor-pointer">
             <span className="text-xs font-medium text-neutral-700">
@@ -522,6 +608,19 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
                 {settings.backgroundColor}
               </span>
             </div>
+          </div>
+        )}
+
+        {/* Live Optimization Summary */}
+        {estBytes > 0 && (
+          <div className="flex items-center justify-between border-t border-neutral-200 pt-3 text-xs">
+            <span className="text-neutral-500">Peso estimado salida</span>
+            <span className="font-mono tabular-nums font-semibold text-neutral-900">
+              ~{formatBytes(estBytes)}
+              {estSavingsPct !== null && estSavingsPct > 0 && (
+                <span className="ml-1.5 text-emerald-700">(-{estSavingsPct}%)</span>
+              )}
+            </span>
           </div>
         )}
       </div>

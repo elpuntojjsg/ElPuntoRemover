@@ -1,6 +1,6 @@
 import JSZip from 'jszip';
 import { applyPostMaskRefinement, removeBackgroundRGBA } from '../shared/bgRemoval';
-import type { BrushHistoryState, EngineSettings, ProcessedOutput } from '../types/studio';
+import type { BrushHistoryState, CropRect, EngineSettings, ProcessedOutput } from '../types/studio';
 
 export interface CachedProxyImage {
   width: number;
@@ -11,11 +11,90 @@ export interface CachedProxyImage {
 const proxyCache = new Map<string, CachedProxyImage>();
 const MAX_PREVIEW_DIM = 820;
 
+export async function safeFetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init);
+  const rawText = await response.text();
+  const trimmed = rawText.trimStart();
+
+  if (trimmed.startsWith('<')) {
+    if (response.status === 413) {
+      throw new Error(
+        'La imagen supera el límite de transferencia del servidor (HTTP 413). Reduce la escala o procesa un formato más ligero.',
+      );
+    }
+    if (response.status === 502 || response.status === 504) {
+      throw new Error(
+        `El servidor tardó demasiado en responder (HTTP ${response.status}). Intenta reducir el tamaño de salida.`,
+      );
+    }
+    throw new Error(
+      `El servidor devolvió una respuesta HTML inesperada (HTTP ${response.status}).`,
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    throw new Error(`Respuesta inválida del servidor (HTTP ${response.status}).`);
+  }
+
+  if (!response.ok) {
+    const errMsg =
+      parsed && typeof parsed === 'object' && 'error' in parsed
+        ? String((parsed as { error: unknown }).error)
+        : `Error del servidor (HTTP ${response.status}).`;
+    throw new Error(errMsg);
+  }
+
+  return parsed as T;
+}
+
+/**
+ * Prevents giant uncompressed RGBA PNG blobs (> 10 MB) from hitting reverse-proxy 413 limits
+ * by encoding them as lossless/near-lossless WebP with full alpha before sending to Sharp/Jimp.
+ */
+export async function compactUploadBlobIfNeeded(blob: Blob): Promise<Blob> {
+  const MAX_DIRECT_BYTES = 10 * 1024 * 1024;
+  if (blob.size <= MAX_DIRECT_BYTES) {
+    return blob;
+  }
+
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = new Image();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('No se pudo compactar la imagen para envío.'));
+      img.src = url;
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return blob;
+    ctx.drawImage(img, 0, 0);
+
+    const webpBlob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob((b) => resolve(b), 'image/webp', 0.98),
+    );
+    if (webpBlob && webpBlob.size < blob.size) {
+      return webpBlob;
+    }
+    return blob;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 export async function loadProxyImage(itemId: string, objectUrl: string): Promise<{
   proxy: CachedProxyImage;
   naturalWidth: number;
   naturalHeight: number;
 }> {
+  const existing = proxyCache.get(itemId);
+
   const img = new Image();
   img.crossOrigin = 'anonymous';
   await new Promise<void>((resolve, reject) => {
@@ -27,7 +106,6 @@ export async function loadProxyImage(itemId: string, objectUrl: string): Promise
   const naturalWidth = img.naturalWidth;
   const naturalHeight = img.naturalHeight;
 
-  const existing = proxyCache.get(itemId);
   if (existing) {
     return { proxy: existing, naturalWidth, naturalHeight };
   }
@@ -163,6 +241,95 @@ export function renderRealtimePreview(
     durationMs,
     transparentRatio,
   };
+}
+
+/**
+ * Computes a tight bounding box around non-transparent pixels (+ 3% padding)
+ * so the crop handles snap around the isolated subject.
+ */
+export function computeSubjectTrimRect(imageData: ImageData): CropRect | null {
+  const { width, height, data } = imageData;
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
+      if (data[(row + x) * 4 + 3] > 20) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (maxX < minX || maxY < minY) return null;
+
+  const padX = Math.max(2, Math.round((maxX - minX) * 0.03));
+  const padY = Math.max(2, Math.round((maxY - minY) * 0.03));
+
+  const x0 = Math.max(0, minX - padX);
+  const y0 = Math.max(0, minY - padY);
+  const x1 = Math.min(width, maxX + 1 + padX);
+  const y1 = Math.min(height, maxY + 1 + padY);
+
+  return {
+    x: x0 / width,
+    y: y0 / height,
+    w: Math.max(0.05, (x1 - x0) / width),
+    h: Math.max(0.05, (y1 - y0) / height),
+  };
+}
+
+export function computeEffectiveDimensions(
+  naturalWidth: number,
+  naturalHeight: number,
+  settings: EngineSettings,
+): { width: number; height: number } {
+  if (naturalWidth <= 0 || naturalHeight <= 0) {
+    return { width: 0, height: 0 };
+  }
+  let w = settings.cropRect ? Math.round(naturalWidth * settings.cropRect.w) : naturalWidth;
+  let h = settings.cropRect ? Math.round(naturalHeight * settings.cropRect.h) : naturalHeight;
+
+  let targetW = w;
+  if (settings.scalePercent < 100) {
+    targetW = Math.max(16, Math.round((w * settings.scalePercent) / 100));
+  }
+  if (settings.maxWidth > 0 && targetW > settings.maxWidth) {
+    targetW = settings.maxWidth;
+  }
+  if (targetW < w) {
+    h = Math.max(1, Math.round((h * targetW) / w));
+    w = targetW;
+  }
+  return { width: w, height: h };
+}
+
+export function estimateOutputBytes(
+  outWidth: number,
+  outHeight: number,
+  settings: EngineSettings,
+): number {
+  const pixels = outWidth * outHeight;
+  if (pixels <= 0) return 0;
+  const q = settings.quality / 100;
+
+  if (settings.format === 'jpg') {
+    return Math.round(pixels * (0.08 + q * q * 0.42));
+  }
+  if (settings.format === 'webp') {
+    return Math.round(pixels * (0.05 + q * q * 0.28));
+  }
+  // PNG: palette quantization cuts size dramatically vs full 32-bit RGBA
+  if (settings.pngOptimize) {
+    const colorFactor = 0.35 + (settings.pngColors / 256) * 0.45;
+    return Math.round(pixels * 0.42 * colorFactor);
+  }
+  return Math.round(pixels * (0.75 + (1 - q) * 0.15));
 }
 
 export function uint8ToBase64(bytes: Uint8Array): string {

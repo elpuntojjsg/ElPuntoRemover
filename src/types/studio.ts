@@ -10,8 +10,16 @@ import type {
 } from '../shared/bgRemoval';
 
 export type PreviewBackdrop = 'checkerboard' | 'white' | 'black' | 'slate' | 'custom';
-export type CanvasTool = 'compare' | 'eyedropper' | 'erase' | 'restore';
+export type CanvasTool = 'compare' | 'crop' | 'eyedropper' | 'erase' | 'restore';
 export type BatchStatus = 'pending' | 'processing' | 'done' | 'error';
+
+export interface CropRect {
+  /** Normalized 0..1 coordinates relative to image dimensions */
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
 
 export interface EngineSettings {
   pipelineMode: PipelineMode;
@@ -19,9 +27,13 @@ export interface EngineSettings {
   engine: ProcessingEngine;
   format: ExportFormat;
   quality: number;
+  scalePercent: number;
   maxWidth: number;
+  pngOptimize: boolean;
+  pngColors: number;
   backgroundColor: string;
   useSolidBackground: boolean;
+  cropRect?: CropRect;
   removal: RemovalOptions;
 }
 

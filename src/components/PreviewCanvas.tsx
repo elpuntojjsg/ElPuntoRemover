@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
   SplitSquareHorizontal,
+  Crop,
   Pipette,
   Eraser,
   Paintbrush,
@@ -10,10 +11,12 @@ import {
   ZoomOut,
   Maximize2,
   RefreshCw,
+  Scissors,
 } from 'lucide-react';
 import type {
   BatchItem,
   CanvasTool,
+  CropRect,
   PreviewBackdrop,
   RgbColor,
 } from '../types/studio';
@@ -23,11 +26,14 @@ import {
   type ImglyProgressInfo,
 } from '../utils/imglyProcessor';
 import {
+  computeSubjectTrimRect,
   loadProxyImage,
   renderImglyPreview,
   renderRealtimePreview,
   type CachedProxyImage,
 } from '../utils/previewProcessor';
+
+type CropHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'move';
 
 interface PreviewCanvasProps {
   item: BatchItem;
@@ -43,9 +49,12 @@ interface PreviewCanvasProps {
   onCommitBrushStroke: (width: number, height: number, nextMask: Uint8Array) => void;
   onUndoBrush: () => void;
   onResetBrush: () => void;
+  onCropChange: (cropRect: CropRect | undefined) => void;
   onSwitchToIllustration: () => void;
   onPreviewStats: (itemId: string, renderMs: number, transparentRatio: number) => void;
 }
+
+const FULL_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
 
 export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   item,
@@ -61,11 +70,13 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   onCommitBrushStroke,
   onUndoBrush,
   onResetBrush,
+  onCropChange,
   onSwitchToIllustration,
   onPreviewStats,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const displayCanvasRef = useRef<HTMLCanvasElement>(null);
+  const stageWrapperRef = useRef<HTMLDivElement>(null);
 
   const [proxy, setProxy] = useState<CachedProxyImage | null>(null);
   const [processedImageData, setProcessedImageData] = useState<ImageData | null>(null);
@@ -83,6 +94,14 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   const [hoverSample, setHoverSample] = useState<{ x: number; y: number; rgb: RgbColor } | null>(
     null,
   );
+
+  // Interactive crop handle dragging state
+  const cropDragRef = useRef<{
+    handle: CropHandle;
+    startX: number;
+    startY: number;
+    startRect: CropRect;
+  } | null>(null);
 
   const workingMaskRef = useRef<Uint8Array | null>(null);
   const isPaintingRef = useRef<boolean>(false);
@@ -172,14 +191,12 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       ? item.brushHistory[item.brushIndex]
       : undefined;
 
-  // Recompute real-time preview whenever proxy, mode, settings, brush, or @imgly result changes
   useEffect(() => {
     if (!proxy) return;
 
     if (item.settings.pipelineMode === 'photo') {
       const cached = getCachedImglyResult(item.id, item.settings.imglyModel);
       if (!cached) {
-        // Show original until @imgly segmentation finishes
         setProcessedImageData(proxy.sourceImageData);
         return;
       }
@@ -311,6 +328,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   };
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (tool === 'crop') return;
     const coords = getCanvasCoords(e.clientX, e.clientY);
     if (!coords || !proxy) return;
 
@@ -368,6 +386,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (tool === 'crop') return;
     const coords = getCanvasCoords(e.clientX, e.clientY);
     if (!coords || !proxy) return;
 
@@ -442,6 +461,86 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     }
   };
 
+  // Crop Handle (Jaladores) drag handlers
+  const activeCrop: CropRect = item.settings.cropRect || FULL_CROP;
+
+  const startCropDrag = (handle: CropHandle, e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    cropDragRef.current = {
+      handle,
+      startX: e.clientX,
+      startY: e.clientY,
+      startRect: { ...activeCrop },
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const moveCropDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = cropDragRef.current;
+    const wrapper = stageWrapperRef.current;
+    if (!drag || !wrapper) return;
+    const rect = wrapper.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    const dx = (e.clientX - drag.startX) / rect.width;
+    const dy = (e.clientY - drag.startY) / rect.height;
+    const minSize = 0.08;
+    const s = drag.startRect;
+
+    let x = s.x;
+    let y = s.y;
+    let right = s.x + s.w;
+    let bottom = s.y + s.h;
+
+    if (drag.handle === 'move') {
+      const nextX = Math.max(0, Math.min(1 - s.w, s.x + dx));
+      const nextY = Math.max(0, Math.min(1 - s.h, s.y + dy));
+      onCropChange({ x: nextX, y: nextY, w: s.w, h: s.h });
+      return;
+    }
+
+    if (drag.handle.includes('w')) {
+      x = Math.max(0, Math.min(right - minSize, s.x + dx));
+    }
+    if (drag.handle.includes('e')) {
+      right = Math.min(1, Math.max(x + minSize, s.x + s.w + dx));
+    }
+    if (drag.handle.includes('n')) {
+      y = Math.max(0, Math.min(bottom - minSize, s.y + dy));
+    }
+    if (drag.handle.includes('s')) {
+      bottom = Math.min(1, Math.max(y + minSize, s.y + s.h + dy));
+    }
+
+    onCropChange({
+      x,
+      y,
+      w: Math.max(minSize, right - x),
+      h: Math.max(minSize, bottom - y),
+    });
+  };
+
+  const endCropDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (cropDragRef.current) {
+      cropDragRef.current = null;
+    }
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+  };
+
+  const handleAutoTrimToSubject = () => {
+    if (!processedImageData) return;
+    const trimmed = computeSubjectTrimRect(processedImageData);
+    if (trimmed) {
+      onCropChange(trimmed);
+      if (tool !== 'crop') {
+        onToolChange('crop');
+      }
+    }
+  };
+
   const backdropStyle: React.CSSProperties =
     backdrop === 'white'
       ? { backgroundColor: '#ffffff' }
@@ -454,6 +553,9 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
             : {};
 
   const hasBrushEdits = item.brushIndex >= 0;
+  const hasCustomCrop = Boolean(item.settings.cropRect);
+  const cropPxW = Math.round(item.naturalWidth * activeCrop.w);
+  const cropPxH = Math.round(item.naturalHeight * activeCrop.h);
 
   return (
     <div className="flex flex-col rounded-xl border border-neutral-200 bg-white overflow-hidden">
@@ -472,6 +574,19 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           >
             <SplitSquareHorizontal className="h-3.5 w-3.5" />
             <span>Comparar</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => onToolChange('crop')}
+            className={`inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              tool === 'crop'
+                ? 'bg-white text-neutral-900 shadow-xs'
+                : 'text-neutral-600 hover:text-neutral-900'
+            }`}
+          >
+            <Crop className="h-3.5 w-3.5" />
+            <span>Encuadrar (Jaladores)</span>
           </button>
 
           {item.settings.pipelineMode === 'illustration' && (
@@ -612,9 +727,27 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
         </div>
       </div>
 
-      {/* Contextual Sub-bar for Brush or Eyedropper */}
-      {(tool === 'erase' || tool === 'restore' || tool === 'eyedropper' || hasBrushEdits) && (
+      {/* Contextual Sub-bar for Crop, Brush, or Eyedropper */}
+      {(tool === 'crop' ||
+        tool === 'erase' ||
+        tool === 'restore' ||
+        tool === 'eyedropper' ||
+        hasBrushEdits ||
+        hasCustomCrop) && (
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-neutral-200 bg-neutral-50 px-4 py-2 text-xs text-neutral-700">
+          {tool === 'crop' && (
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="font-medium text-neutral-900">
+                Arrastra los jaladores de esquinas o bordes para recortar márgenes vacíos
+              </span>
+              {cropPxW > 0 && cropPxH > 0 && (
+                <span className="font-mono tabular-nums text-neutral-600">
+                  Recorte: {cropPxW} × {cropPxH} px
+                </span>
+              )}
+            </div>
+          )}
+
           {tool === 'eyedropper' && (
             <div className="flex items-center gap-2">
               <span>Haz clic sobre el fondo en la imagen para añadir ese color a la extracción.</span>
@@ -652,30 +785,59 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
             </div>
           )}
 
-          {tool === 'compare' && hasBrushEdits && (
-            <span className="text-neutral-600">Máscara manual activa sobre el recorte.</span>
+          {tool === 'compare' && (hasBrushEdits || hasCustomCrop) && (
+            <span className="text-neutral-600">
+              {hasCustomCrop
+                ? `Encuadre activo (${cropPxW} × ${cropPxH} px)`
+                : 'Máscara manual activa'}
+            </span>
           )}
 
-          {hasBrushEdits && (
-            <div className="flex items-center gap-2 ml-auto">
-              <button
-                type="button"
-                onClick={onUndoBrush}
-                className="inline-flex h-7 items-center gap-1 rounded border border-neutral-300 bg-white px-2.5 text-xs font-medium text-neutral-700 hover:bg-neutral-50 cursor-pointer"
-              >
-                <Undo2 className="h-3 w-3" />
-                <span>Deshacer trazo</span>
-              </button>
-              <button
-                type="button"
-                onClick={onResetBrush}
-                className="inline-flex h-7 items-center gap-1 rounded border border-neutral-300 bg-white px-2.5 text-xs font-medium text-neutral-700 hover:bg-neutral-50 cursor-pointer"
-              >
-                <RotateCcw className="h-3 w-3" />
-                <span>Limpiar máscara</span>
-              </button>
-            </div>
-          )}
+          <div className="flex flex-wrap items-center gap-2 ml-auto">
+            {(tool === 'crop' || hasCustomCrop) && (
+              <>
+                <button
+                  type="button"
+                  onClick={handleAutoTrimToSubject}
+                  className="inline-flex h-7 items-center gap-1 rounded border border-blue-200 bg-blue-50 px-2.5 text-xs font-medium text-blue-700 hover:bg-blue-100 cursor-pointer"
+                >
+                  <Scissors className="h-3 w-3" />
+                  <span>Ajustar al sujeto</span>
+                </button>
+                {hasCustomCrop && (
+                  <button
+                    type="button"
+                    onClick={() => onCropChange(undefined)}
+                    className="inline-flex h-7 items-center gap-1 rounded border border-neutral-300 bg-white px-2.5 text-xs font-medium text-neutral-700 hover:bg-neutral-50 cursor-pointer"
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                    <span>Restablecer encuadre</span>
+                  </button>
+                )}
+              </>
+            )}
+
+            {hasBrushEdits && (
+              <>
+                <button
+                  type="button"
+                  onClick={onUndoBrush}
+                  className="inline-flex h-7 items-center gap-1 rounded border border-neutral-300 bg-white px-2.5 text-xs font-medium text-neutral-700 hover:bg-neutral-50 cursor-pointer"
+                >
+                  <Undo2 className="h-3 w-3" />
+                  <span>Deshacer trazo</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={onResetBrush}
+                  className="inline-flex h-7 items-center gap-1 rounded border border-neutral-300 bg-white px-2.5 text-xs font-medium text-neutral-700 hover:bg-neutral-50 cursor-pointer"
+                >
+                  <RotateCcw className="h-3 w-3" />
+                  <span>Limpiar máscara</span>
+                </button>
+              </>
+            )}
+          </div>
         </div>
       )}
 
@@ -702,6 +864,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
 
         {!loadingProxy && !loadError && proxy && (
           <div
+            ref={stageWrapperRef}
             className="relative inline-block select-none shadow-sm"
             style={{
               transform: `scale(${zoom})`,
@@ -716,13 +879,16 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
               className={`block max-h-[510px] max-w-full rounded ${
                 tool === 'compare'
                   ? 'cursor-ew-resize'
-                  : tool === 'eyedropper'
-                    ? 'cursor-crosshair'
-                    : 'cursor-cell'
+                  : tool === 'crop'
+                    ? 'cursor-default'
+                    : tool === 'eyedropper'
+                      ? 'cursor-crosshair'
+                      : 'cursor-cell'
               }`}
               style={{ width: 'auto', height: 'auto' }}
             />
 
+            {/* Split Line Overlay in Compare Mode */}
             {tool === 'compare' && (
               <div
                 className="pointer-events-none absolute inset-y-0 w-0.5 bg-white shadow-[0_0_0_1px_rgba(15,23,42,0.35)]"
@@ -737,6 +903,130 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
                 <span className="absolute top-2 left-2 rounded bg-blue-600/90 px-2 py-0.5 text-[11px] font-medium text-white whitespace-nowrap">
                   Recorte
                 </span>
+              </div>
+            )}
+
+            {/* Subtle Crop Guide when custom crop is active in non-crop tools */}
+            {tool !== 'crop' && hasCustomCrop && (
+              <div
+                className="pointer-events-none absolute border border-dashed border-blue-600/80"
+                style={{
+                  left: `${activeCrop.x * 100}%`,
+                  top: `${activeCrop.y * 100}%`,
+                  width: `${activeCrop.w * 100}%`,
+                  height: `${activeCrop.h * 100}%`,
+                }}
+              />
+            )}
+
+            {/* Interactive Crop Box with 8 Jaladores (Corner & Edge Handles) */}
+            {tool === 'crop' && (
+              <div className="absolute inset-0 overflow-hidden rounded">
+                {/* Darkened exterior mask around crop rectangle */}
+                <div
+                  className="pointer-events-none absolute inset-x-0 top-0 bg-neutral-950/45"
+                  style={{ height: `${activeCrop.y * 100}%` }}
+                />
+                <div
+                  className="pointer-events-none absolute inset-x-0 bottom-0 bg-neutral-950/45"
+                  style={{ height: `${(1 - activeCrop.y - activeCrop.h) * 100}%` }}
+                />
+                <div
+                  className="pointer-events-none absolute left-0 bg-neutral-950/45"
+                  style={{
+                    top: `${activeCrop.y * 100}%`,
+                    height: `${activeCrop.h * 100}%`,
+                    width: `${activeCrop.x * 100}%`,
+                  }}
+                />
+                <div
+                  className="pointer-events-none absolute right-0 bg-neutral-950/45"
+                  style={{
+                    top: `${activeCrop.y * 100}%`,
+                    height: `${activeCrop.h * 100}%`,
+                    width: `${(1 - activeCrop.x - activeCrop.w) * 100}%`,
+                  }}
+                />
+
+                {/* Active Crop Box + 8 Handles */}
+                <div
+                  onPointerDown={(e) => startCropDrag('move', e)}
+                  onPointerMove={moveCropDrag}
+                  onPointerUp={endCropDrag}
+                  className="absolute border-2 border-blue-500 cursor-move"
+                  style={{
+                    left: `${activeCrop.x * 100}%`,
+                    top: `${activeCrop.y * 100}%`,
+                    width: `${activeCrop.w * 100}%`,
+                    height: `${activeCrop.h * 100}%`,
+                  }}
+                >
+                  {/* Rule of thirds hairline */}
+                  <div className="pointer-events-none absolute inset-x-0 top-1/3 border-t border-white/30" />
+                  <div className="pointer-events-none absolute inset-x-0 top-2/3 border-t border-white/30" />
+                  <div className="pointer-events-none absolute inset-y-0 left-1/3 border-l border-white/30" />
+                  <div className="pointer-events-none absolute inset-y-0 left-2/3 border-l border-white/30" />
+
+                  {/* 4 Corner Jaladores */}
+                  <div
+                    onPointerDown={(e) => startCropDrag('nw', e)}
+                    onPointerMove={moveCropDrag}
+                    onPointerUp={endCropDrag}
+                    title="Ajustar esquina superior izquierda"
+                    className="absolute -left-2 -top-2 h-4 w-4 rounded-sm border-2 border-blue-600 bg-white shadow cursor-nwse-resize"
+                  />
+                  <div
+                    onPointerDown={(e) => startCropDrag('ne', e)}
+                    onPointerMove={moveCropDrag}
+                    onPointerUp={endCropDrag}
+                    title="Ajustar esquina superior derecha"
+                    className="absolute -right-2 -top-2 h-4 w-4 rounded-sm border-2 border-blue-600 bg-white shadow cursor-nesw-resize"
+                  />
+                  <div
+                    onPointerDown={(e) => startCropDrag('sw', e)}
+                    onPointerMove={moveCropDrag}
+                    onPointerUp={endCropDrag}
+                    title="Ajustar esquina inferior izquierda"
+                    className="absolute -bottom-2 -left-2 h-4 w-4 rounded-sm border-2 border-blue-600 bg-white shadow cursor-nesw-resize"
+                  />
+                  <div
+                    onPointerDown={(e) => startCropDrag('se', e)}
+                    onPointerMove={moveCropDrag}
+                    onPointerUp={endCropDrag}
+                    title="Ajustar esquina inferior derecha"
+                    className="absolute -bottom-2 -right-2 h-4 w-4 rounded-sm border-2 border-blue-600 bg-white shadow cursor-nwse-resize"
+                  />
+
+                  {/* 4 Edge Jaladores */}
+                  <div
+                    onPointerDown={(e) => startCropDrag('n', e)}
+                    onPointerMove={moveCropDrag}
+                    onPointerUp={endCropDrag}
+                    title="Ajustar borde superior"
+                    className="absolute left-1/2 -top-1.5 h-3 w-7 -translate-x-1/2 rounded-sm border border-blue-600 bg-white shadow cursor-ns-resize"
+                  />
+                  <div
+                    onPointerDown={(e) => startCropDrag('s', e)}
+                    onPointerMove={moveCropDrag}
+                    onPointerUp={endCropDrag}
+                    title="Ajustar borde inferior"
+                    className="absolute left-1/2 -bottom-1.5 h-3 w-7 -translate-x-1/2 rounded-sm border border-blue-600 bg-white shadow cursor-ns-resize"
+                  />
+                  <div
+                    onPointerDown={(e) => startCropDrag('w', e)}
+                    onPointerMove={moveCropDrag}
+                    onPointerUp={endCropDrag}
+                    title="Ajustar borde izquierdo"
+                    className="absolute top-1/2 -left-1.5 h-7 w-3 -translate-y-1/2 rounded-sm border border-blue-600 bg-white shadow cursor-ew-resize"
+                  />
+                  <div
+                    onPointerDown={(e) => startCropDrag('e', e)}
+                    onPointerMove={moveCropDrag}
+                    onPointerUp={endCropDrag}
+                    title="Ajustar borde derecho"
+                    className="absolute top-1/2 -right-1.5 h-7 w-3 -translate-y-1/2 rounded-sm border border-blue-600 bg-white shadow cursor-ew-resize"
+                  />
+                </div>
               </div>
             )}
           </div>
@@ -790,7 +1080,9 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           <span className="font-medium text-neutral-900 truncate max-w-[240px]">{item.name}</span>
           <span aria-hidden="true">·</span>
           <span className="font-mono tabular-nums">
-            {item.naturalWidth} × {item.naturalHeight} px
+            {hasCustomCrop
+              ? `${cropPxW} × ${cropPxH} px (recortado)`
+              : `${item.naturalWidth} × ${item.naturalHeight} px`}
           </span>
           {typeof item.previewTransparentRatio === 'number' && (
             <>

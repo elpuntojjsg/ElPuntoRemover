@@ -4,6 +4,7 @@ import { DEFAULT_REMOVAL_OPTIONS, type PipelineMode } from './shared/bgRemoval';
 import type {
   BatchItem,
   CanvasTool,
+  CropRect,
   EngineSettings,
   PreviewBackdrop,
   ProcessedOutput,
@@ -16,9 +17,11 @@ import {
 } from './utils/imglyProcessor';
 import {
   clearProxyCache,
+  compactUploadBlobIfNeeded,
   downloadBatchZip,
   downloadDataUrl,
   loadProxyImage,
+  safeFetchJson,
   uint8ToBase64,
 } from './utils/previewProcessor';
 import { DropZoneStage } from './components/DropZoneStage';
@@ -37,9 +40,13 @@ function createDefaultSettings(
     engine: 'sharp',
     format: 'png',
     quality: 90,
+    scalePercent: 100,
     maxWidth: 0,
+    pngOptimize: false,
+    pngColors: 256,
     backgroundColor: '#ffffff',
     useSolidBackground: false,
+    cropRect: undefined,
     removal: {
       ...DEFAULT_REMOVAL_OPTIONS,
       tolerance: tolerance ?? DEFAULT_REMOVAL_OPTIONS.tolerance,
@@ -76,12 +83,15 @@ export default function App() {
     [items, activeId],
   );
 
-  // Add local Files to queue and read natural dimensions
+  // Add local Files to queue and decode thumbnails/dimensions smoothly without blocking main thread
   const addFilesToQueue = useCallback(
     async (files: File[], presetTolerances?: number[]) => {
       if (files.length === 0) return;
 
-      const created: BatchItem[] = files.slice(0, 30).map((file, idx) => {
+      const availableSlots = Math.max(0, 30 - items.length);
+      const accepted = files.slice(0, availableSlots > 0 ? availableSlots : 30);
+
+      const created: BatchItem[] = accepted.map((file, idx) => {
         const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${idx}`;
         const url = URL.createObjectURL(file);
         return {
@@ -100,12 +110,20 @@ export default function App() {
       });
 
       setItems((prev) => [...prev, ...created].slice(0, 30));
-      setActiveId((prevActive) => prevActive || created[0].id);
+      setActiveId((prevActive) => prevActive || created[0]?.id || '');
       setBanner(null);
 
-      for (const entry of created) {
-        loadProxyImage(entry.id, entry.originalUrl)
-          .then(({ naturalWidth, naturalHeight }) => {
+      // Throttled 2-worker queue for decoding image dimensions without UI freeze
+      let cursor = 0;
+      const workerCount = Math.min(2, created.length);
+      const workers = Array.from({ length: workerCount }, async () => {
+        while (cursor < created.length) {
+          const entry = created[cursor++];
+          try {
+            const { naturalWidth, naturalHeight } = await loadProxyImage(
+              entry.id,
+              entry.originalUrl,
+            );
             setItems((prev) =>
               prev.map((item) =>
                 item.id === entry.id
@@ -113,13 +131,17 @@ export default function App() {
                   : item,
               ),
             );
-          })
-          .catch(() => {
-            // Handled in canvas preview if broken image
-          });
-      }
+          } catch {
+            // Handled in canvas preview if image fails
+          }
+          // Yield to browser paint loop between images
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      });
+
+      await Promise.all(workers);
     },
-    [defaultPipelineMode],
+    [defaultPipelineMode, items.length],
   );
 
   // Clipboard paste support (Ctrl+V)
@@ -213,6 +235,14 @@ export default function App() {
     });
   };
 
+  const handleCropChange = (cropRect: CropRect | undefined) => {
+    if (!activeItem) return;
+    handleUpdateActiveSettings({
+      ...activeItem.settings,
+      cropRect,
+    });
+  };
+
   const handleApplySettingsToAll = () => {
     if (!activeItem) return;
     const base = activeItem.settings;
@@ -221,6 +251,7 @@ export default function App() {
         ...item,
         settings: {
           ...base,
+          cropRect: item.id === activeItem.id ? base.cropRect : item.settings.cropRect,
           removal: {
             ...base.removal,
             targetColors: [...(base.removal.targetColors || [])],
@@ -230,11 +261,11 @@ export default function App() {
     );
     setBanner({
       type: 'success',
-      message: `Ajustes aplicados a los ${items.length} archivos (${
+      message: `Ajustes de optimización y recorte aplicados a los ${items.length} archivos (${
         base.pipelineMode === 'photo'
           ? `Modo Fotografía / Cabello · @imgly ${base.imglyModel}`
           : 'Modo Ilustración / Degradado'
-      }, ${base.engine === 'sharp' ? 'Sharp' : 'Jimp'}, ${base.format.toUpperCase()}).`,
+      }, ${base.engine === 'sharp' ? 'Sharp' : 'Jimp'}, ${base.format.toUpperCase()} al ${base.scalePercent}%).`,
     });
   };
 
@@ -314,6 +345,47 @@ export default function App() {
     setBanner(null);
   };
 
+  const processItemOnServer = async (item: BatchItem): Promise<ProcessedOutput> => {
+    let uploadBlob: Blob = item.file;
+    let preSegmented = false;
+
+    if (item.settings.pipelineMode === 'photo') {
+      const segmented = await runImglySegmentation(
+        item.id,
+        item.file,
+        item.settings.imglyModel,
+      );
+      uploadBlob = segmented.blob;
+      preSegmented = true;
+    }
+
+    uploadBlob = await compactUploadBlobIfNeeded(uploadBlob);
+
+    const fd = new FormData();
+    fd.append('image', uploadBlob, item.name);
+    fd.append(
+      'settings',
+      JSON.stringify({
+        ...item.settings,
+        preSegmented,
+      }),
+    );
+    const brushLayer =
+      item.brushIndex >= 0 ? item.brushHistory[item.brushIndex] : undefined;
+    if (brushLayer) {
+      fd.append(
+        'brushMask',
+        JSON.stringify({
+          width: brushLayer.width,
+          height: brushLayer.height,
+          base64: uint8ToBase64(brushLayer.data),
+        }),
+      );
+    }
+
+    return safeFetchJson<ProcessedOutput>('/api/process', { method: 'POST', body: fd });
+  };
+
   const handleProcessCurrent = async () => {
     if (!activeItem) return;
     setIsProcessingCurrent(true);
@@ -325,48 +397,7 @@ export default function App() {
     );
 
     try {
-      let uploadBlob: Blob = activeItem.file;
-      let preSegmented = false;
-
-      if (activeItem.settings.pipelineMode === 'photo') {
-        const segmented = await runImglySegmentation(
-          activeItem.id,
-          activeItem.file,
-          activeItem.settings.imglyModel,
-        );
-        uploadBlob = segmented.blob;
-        preSegmented = true;
-      }
-
-      const fd = new FormData();
-      fd.append('image', uploadBlob, activeItem.name);
-      fd.append(
-        'settings',
-        JSON.stringify({
-          ...activeItem.settings,
-          preSegmented,
-        }),
-      );
-      const brushLayer =
-        activeItem.brushIndex >= 0 ? activeItem.brushHistory[activeItem.brushIndex] : undefined;
-      if (brushLayer) {
-        fd.append(
-          'brushMask',
-          JSON.stringify({
-            width: brushLayer.width,
-            height: brushLayer.height,
-            base64: uint8ToBase64(brushLayer.data),
-          }),
-        );
-      }
-
-      const response = await fetch('/api/process', { method: 'POST', body: fd });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.error || 'Error al exportar la imagen.');
-      }
-
-      const output = data as ProcessedOutput;
+      const output = await processItemOnServer(activeItem);
       setItems((prev) =>
         prev.map((item) =>
           item.id === activeItem.id ? { ...item, status: 'done', output, error: undefined } : item,
@@ -399,113 +430,77 @@ export default function App() {
     }
 
     setIsProcessingBatch(true);
-    setBatchProgressText(null);
     setBanner(null);
-    setItems((prev) => prev.map((item) => ({ ...item, status: 'processing', error: undefined })));
+    setBatchProgressText(`Preparando lote de ${items.length} imágenes...`);
 
-    try {
-      const fd = new FormData();
-      const clientIds: string[] = [];
-      const itemOverrides: Record<string, unknown> = {};
+    const t0 = performance.now();
+    const snapshot = [...items];
+    let completed = 0;
+    let okCount = 0;
+    let firstError: string | null = null;
 
-      for (let idx = 0; idx < items.length; idx++) {
-        const item = items[idx];
-        let uploadBlob: Blob = item.file;
-        let preSegmented = false;
+    setItems((prev) => prev.map((item) => ({ ...item, status: 'pending', error: undefined })));
 
-        if (item.settings.pipelineMode === 'photo') {
-          setBatchProgressText(
-            `Segmentando ${idx + 1}/${items.length} con @imgly (${item.settings.imglyModel})...`,
-          );
-          const segmented = await runImglySegmentation(
-            item.id,
-            item.file,
-            item.settings.imglyModel,
-          );
-          uploadBlob = segmented.blob;
-          preSegmented = true;
-        }
+    // Process each image via /api/process with concurrency 2 so requests stay well below proxy payload limits
+    let cursor = 0;
+    const concurrency = Math.min(2, snapshot.length);
 
-        fd.append('images', uploadBlob, item.name);
-        clientIds.push(item.id);
-        const brushLayer =
-          item.brushIndex >= 0 ? item.brushHistory[item.brushIndex] : undefined;
-        itemOverrides[item.id] = {
-          settings: {
-            ...item.settings,
-            preSegmented,
-          },
-          brushMask: brushLayer
-            ? {
-                width: brushLayer.width,
-                height: brushLayer.height,
-                base64: uint8ToBase64(brushLayer.data),
-              }
-            : undefined,
-        };
-      }
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (cursor < snapshot.length) {
+        const item = snapshot[cursor++];
+        setItems((prev) =>
+          prev.map((it) => (it.id === item.id ? { ...it, status: 'processing' } : it)),
+        );
+        setBatchProgressText(
+          `Procesando ${completed + 1} de ${snapshot.length}: ${item.name}`,
+        );
 
-      setBatchProgressText('Codificando lote en servidor con Sharp / Jimp...');
-      const fallbackSettings = activeItem?.settings || items[0].settings;
-      fd.append('settings', JSON.stringify(fallbackSettings));
-      fd.append('clientIds', JSON.stringify(clientIds));
-      fd.append('itemOverrides', JSON.stringify(itemOverrides));
-
-      const response = await fetch('/api/process-batch', { method: 'POST', body: fd });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.error || 'Error al procesar el lote.');
-      }
-
-      const resultList = (data.results || []) as Array<
-        { clientId: string; ok: boolean; error?: string } & Partial<ProcessedOutput>
-      >;
-      const resultMap = new Map(resultList.map((r) => [r.clientId, r]));
-
-      let okCount = 0;
-      setItems((prev) =>
-        prev.map((item) => {
-          const res = resultMap.get(item.id);
-          if (!res) return { ...item, status: 'error', error: 'Sin respuesta del servidor' };
-          if (!res.ok) {
-            return { ...item, status: 'error', error: res.error || 'Error al procesar' };
-          }
+        try {
+          const output = await processItemOnServer(item);
           okCount++;
-          return {
-            ...item,
-            status: 'done',
-            error: undefined,
-            output: {
-              filename: res.filename!,
-              mimeType: res.mimeType!,
-              format: res.format!,
-              width: res.width!,
-              height: res.height!,
-              originalBytes: res.originalBytes!,
-              outputBytes: res.outputBytes!,
-              durationMs: res.durationMs!,
-              engineUsed: res.engineUsed!,
-              dataUrl: res.dataUrl!,
-            },
-          };
-        }),
-      );
+          setItems((prev) =>
+            prev.map((it) =>
+              it.id === item.id ? { ...it, status: 'done', output, error: undefined } : it,
+            ),
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'Error al procesar archivo';
+          if (!firstError) firstError = msg;
+          setItems((prev) =>
+            prev.map((it) => (it.id === item.id ? { ...it, status: 'error', error: msg } : it)),
+          );
+        } finally {
+          completed++;
+          setBatchProgressText(
+            `Completadas ${completed} de ${snapshot.length} imágenes...`,
+          );
+        }
+      }
+    });
 
+    await Promise.all(workers);
+
+    const totalMs = Math.max(1, Math.round(performance.now() - t0));
+    setIsProcessingBatch(false);
+    setBatchProgressText(null);
+
+    if (okCount === snapshot.length) {
       setBanner({
-        type: okCount > 0 ? 'success' : 'error',
-        message:
-          okCount > 0
-            ? `Lote completado: ${okCount} de ${items.length} imágenes procesadas en ${data.totalDurationMs} ms.`
-            : 'No se pudo procesar ninguna imagen del lote.',
+        type: 'success',
+        message: `Lote completado: ${okCount} de ${snapshot.length} imágenes procesadas en ${totalMs} ms.`,
         canDownloadZip: okCount > 1,
       });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Fallo al procesar el lote.';
-      setItems((prev) => prev.map((item) => ({ ...item, status: 'error', error: message })));
-      setBanner({ type: 'error', message });
-    } finally {
-      setIsProcessingBatch(false);
-      setBatchProgressText(null);
+    } else if (okCount > 0) {
+      setBanner({
+        type: 'error',
+        message: `Lote parcial: ${okCount} de ${snapshot.length} exportadas.${firstError ? ` Primer error: ${firstError}` : ''}`,
+        canDownloadZip: okCount > 1,
+      });
+    } else {
+      setBanner({
+        type: 'error',
+        message: firstError || 'No se pudo procesar ninguna imagen del lote.',
+      });
     }
   };
 
@@ -736,6 +731,7 @@ export default function App() {
                   onCommitBrushStroke={handleCommitBrushStroke}
                   onUndoBrush={handleUndoBrush}
                   onResetBrush={handleResetBrush}
+                  onCropChange={handleCropChange}
                   onSwitchToIllustration={() => handleSwitchActivePipelineMode('illustration')}
                   onPreviewStats={handlePreviewStats}
                 />
@@ -758,6 +754,9 @@ export default function App() {
               <div className="lg:sticky lg:top-22">
                 <InspectorPanel
                   settings={activeItem.settings}
+                  naturalWidth={activeItem.naturalWidth}
+                  naturalHeight={activeItem.naturalHeight}
+                  originalBytes={activeItem.originalBytes}
                   batchCount={items.length}
                   isProcessingCurrent={isProcessingCurrent}
                   isProcessingBatch={isProcessingBatch}
@@ -790,10 +789,10 @@ export default function App() {
             </div>
             <div className="border-t border-neutral-200 pt-4">
               <h3 className="font-display text-sm font-semibold text-neutral-900">
-                02. Previsualiza y retoca en tiempo real
+                02. Ajusta con jaladores y encuadra
               </h3>
               <p className="mt-2 text-sm text-neutral-600 leading-relaxed">
-                Inspecciona los bordes sobre damero o fondos de prueba con el comparador Antes/Después, cuentagotas o pinceles de borrado y restauración.
+                Recorta márgenes con los jaladores sobre el lienzo y regula escala, calidad y paleta PNG de 8-bit viendo el peso estimado antes de exportar.
               </p>
             </div>
             <div className="border-t border-neutral-200 pt-4">
@@ -801,7 +800,7 @@ export default function App() {
                 03. Exporta con Sharp o Jimp por lote
               </h3>
               <p className="mt-2 text-sm text-neutral-600 leading-relaxed">
-                Finaliza el lote completo en PNG transparente, WebP o JPG usando Sharp (libvips) o Jimp y descarga todos los resultados juntos en un archivo ZIP.
+                Procesa cada archivo sin bloqueos en PNG transparente, WebP ligero o JPG usando Sharp (libvips) o Jimp y descarga todo el lote en un archivo ZIP.
               </p>
             </div>
           </div>
